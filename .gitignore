@@ -1,0 +1,6 @@
+env/
+out*
+tests
+__*
+.agents
+.codex
