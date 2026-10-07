@@ -1,0 +1,1 @@
+env/bin/python normalize_by_interframe.py /home/user/proj/film2/film-projects/captures-good-1   --output out-interframe-1   --log out-interframe-1/positions.json   --annotate out-interframe-1/debug   --mirror-horizontal   --output-size 2880x2160   --jpeg-quality 100

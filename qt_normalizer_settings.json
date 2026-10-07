@@ -1,0 +1,21 @@
+{
+  "output_dir": "/home/user/proj/film2/projector-scan/out",
+  "output_width": 2880,
+  "output_height": 2160,
+  "jpeg_quality": 100,
+  "gap_pixels": 28,
+  "crop_scale_percent": 104,
+  "y_offset_percent": 0,
+  "color_mode": "auto",
+  "mirror_horizontal": true,
+  "lock_aspect": true,
+  "edit_search": false,
+  "search_area": {
+    "x": 2679,
+    "y": 1342,
+    "width": 1,
+    "height": 1,
+    "x2": 2679,
+    "y2": 1342
+  }
+}

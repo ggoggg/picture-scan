@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
 import uuid
 from pathlib import Path
 
@@ -36,9 +37,14 @@ def parse_args() -> argparse.Namespace:
         help="Output number width. Default: 6.",
     )
     parser.add_argument(
+        "--mirror-horizontal",
+        action="store_true",
+        help="Mirror every matching image left-to-right in place, including unchanged filenames. Requires Pillow; JPEGs are re-encoded.",
+    )
+    parser.add_argument(
         "--apply",
         action="store_true",
-        help="Actually rename files. Without this, only print the planned changes.",
+        help="Actually rename and optionally mirror files. Without this, only print the planned changes.",
     )
     return parser.parse_args()
 
@@ -116,6 +122,26 @@ def apply_renames(renames: list[tuple[Path, Path]]) -> None:
         temporary_by_source_name[source].rename(target)
 
 
+def mirror_horizontal(path: Path) -> None:
+    from PIL import Image, ImageOps
+
+    temporary = path.with_name(f".{path.name}.mirror-{uuid.uuid4().hex}.tmp")
+    try:
+        with Image.open(path) as original:
+            image = ImageOps.mirror(ImageOps.exif_transpose(original))
+            options = {}
+            for key in ("exif", "icc_profile", "dpi"):
+                if key in image.info:
+                    options[key] = image.info[key]
+            if original.format == "JPEG":
+                options.update(quality=95, subsampling=0)
+            image.save(temporary, format=original.format, **options)
+        shutil.copymode(path, temporary)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def main() -> int:
     args = parse_args()
     if not args.folder.is_dir():
@@ -130,7 +156,7 @@ def main() -> int:
         raise SystemExit("No matching files found.")
 
     renames = planned_renames(files, prefix, args.suffix, args.start, args.digits)
-    if not renames:
+    if not renames and not args.mirror_horizontal:
         print("Sequence is already continuous.")
         return 0
 
@@ -139,11 +165,28 @@ def main() -> int:
     for source, target in renames:
         print(f"{source.name} -> {target.name}")
 
+    if args.mirror_horizontal:
+        print(f"Mirror horizontally: all {len(files)} matching image(s), including unchanged filenames.")
+
     if args.apply:
+        if args.mirror_horizontal:
+            try:
+                from PIL import Image  # noqa: F401
+            except ImportError as error:
+                raise SystemExit("Horizontal mirroring requires Pillow. Install with: python -m pip install Pillow") from error
+            for index, (_, source) in enumerate(files, start=1):
+                try:
+                    mirror_horizontal(source)
+                except Exception as error:
+                    raise SystemExit(
+                        f"Mirroring failed for {source.name}: {error}. "
+                        f"{index - 1} image(s) already mirrored; renumbering has not started."
+                    ) from error
+                print(f"Mirrored {index}/{len(files)}: {source.name}")
         apply_renames(renames)
         print(f"Renamed {len(renames)} file(s).")
     else:
-        print(f"Dry run: {len(renames)} file(s) would be renamed. Add --apply to rename.")
+        print(f"Dry run: {len(renames)} file(s) would be renamed. Add --apply to perform the planned changes.")
 
     return 0
 

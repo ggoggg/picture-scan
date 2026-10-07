@@ -101,6 +101,37 @@ class CropStitch:
         }
 
 
+@dataclass
+class SearchArea:
+    x1: int | float = 0
+    x2: int | float | None = None
+    y1: int | float = 0
+    y2: int | float | None = None
+
+    @staticmethod
+    def resolve_bound(value: int | float | None, upper: int, default: int) -> int:
+        if value is None:
+            return default
+        if isinstance(value, float):
+            return round(upper * value)
+        return value
+
+    def bounds(self, image_width: int, image_height: int) -> tuple[int, int, int, int]:
+        x1 = self.resolve_bound(self.x1, image_width, 0)
+        x2 = self.resolve_bound(self.x2, image_width, image_width)
+        y1 = self.resolve_bound(self.y1, image_height, 0)
+        y2 = self.resolve_bound(self.y2, image_height, image_height)
+        x1 = min(max(0, x1), image_width - 1)
+        y1 = min(max(0, y1), image_height - 1)
+        x2 = min(max(x1 + 1, x2), image_width)
+        y2 = min(max(y1 + 1, y2), image_height)
+        return x1, x2, y1, y2
+
+    def to_log_dict(self, image_width: int, image_height: int) -> dict[str, int]:
+        x1, x2, y1, y2 = self.bounds(image_width, image_height)
+        return {"x1": x1, "x2": x2, "y1": y1, "y2": y2}
+
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg"}
 
 
@@ -126,6 +157,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1000,
         help="Ignore white components smaller than this many pixels. Default: 1000.",
+    )
+    parser.add_argument(
+        "--perforation-search-x",
+        default="85%:",
+        help="Limit perforation detection to this horizontal range, as START:END pixels or percentages. Default: 85%%:.",
+    )
+    parser.add_argument(
+        "--perforation-search-y",
+        default="20%:85%",
+        help="Limit perforation detection to this vertical range, as START:END pixels or percentages. Default: 20%%:85%%.",
     )
     parser.add_argument(
         "--log",
@@ -208,14 +249,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--right-gap-perf-ratio",
         type=float,
-        default=0.2,
-        help="Gap between crop right edge and perforation left edge, relative to perf width. Default: 0.2.",
+        default=0.0,
+        help="Deprecated. Horizontal crop now ends exactly at the perforation left edge.",
     )
     parser.add_argument(
         "--center-y-offset-perf-ratio",
         type=float,
         default=0.0,
-        help="Vertical crop center offset from perforation center, relative to perf height. Default: 0.0.",
+        help="Vertical crop center offset from perforation center, relative to perf height. Positive moves crop down. Default: 0.0.",
     )
     parser.add_argument(
         "--no-deskew",
@@ -341,15 +382,26 @@ def find_white_components(mask: np.ndarray, min_area: int) -> list[Component]:
     return components
 
 
-def choose_perforation(components: list[Component], image_width: int, image_height: int) -> Component | None:
+def choose_perforation(
+    components: list[Component],
+    image_width: int,
+    image_height: int,
+    size_image_width: int | None = None,
+    size_image_height: int | None = None,
+) -> Component | None:
     if not components:
         return None
 
+    size_width = image_width if size_image_width is None else size_image_width
+    size_height = image_height if size_image_height is None else size_image_height
     likely_perforations: list[Component] = []
     for component in components:
         aspect = component.height / float(component.width)
         touches_right_edge = component.x2 >= image_width * 0.97
-        reasonable_size = component.width <= image_width * 0.20 and component.height <= image_height * 0.50
+        reasonable_size = (
+            size_width * 0.025 <= component.width <= size_width * 0.20
+            and size_height * 0.05 <= component.height <= size_height * 0.50
+        )
         perforation_shape = 0.65 <= aspect <= 6.0
         if touches_right_edge and reasonable_size and perforation_shape:
             likely_perforations.append(component)
@@ -361,10 +413,83 @@ def choose_perforation(components: list[Component], image_width: int, image_heig
         likely_perforations,
         key=lambda component: (
             component.x2,
-            component.fill_ratio,
             component.area,
+            component.fill_ratio,
         ),
     )
+
+
+def merge_fragment_group(group: list[Component]) -> Component:
+    x1 = min(component.x for component in group)
+    y1 = min(component.y for component in group)
+    x2 = max(component.x2 for component in group)
+    y2 = max(component.y2 for component in group)
+    area = sum(component.area for component in group)
+    width = x2 - x1 + 1
+    height = y2 - y1 + 1
+    fill_ratio = area / float(width * height)
+    angle_degrees = max(group, key=lambda component: component.area).angle_degrees
+    return Component(
+        x=x1,
+        y=y1,
+        width=width,
+        height=height,
+        area=area,
+        fill_ratio=fill_ratio,
+        angle_degrees=angle_degrees,
+        repaired=True,
+    )
+
+
+def add_merged_perforation_fragments(
+    components: list[Component],
+    image_width: int,
+    image_height: int,
+    size_image_width: int,
+    size_image_height: int,
+) -> list[Component]:
+    right_edge_fragments = [
+        component
+        for component in components
+        if component.x2 >= image_width * 0.94
+        and size_image_width * 0.02 <= component.width <= size_image_width * 0.20
+        and size_image_height * 0.03 <= component.height <= size_image_height * 0.30
+    ]
+    if len(right_edge_fragments) < 2:
+        return components
+
+    merged_components: list[Component] = []
+    used_indexes: set[int] = set()
+    max_vertical_gap = round(size_image_height * 0.04)
+
+    for index, component in enumerate(right_edge_fragments):
+        if index in used_indexes:
+            continue
+        group = [component]
+        used_indexes.add(index)
+        changed = True
+        while changed:
+            changed = False
+            group_x1 = min(item.x for item in group)
+            group_x2 = max(item.x2 for item in group)
+            group_y1 = min(item.y for item in group)
+            group_y2 = max(item.y2 for item in group)
+            for other_index, other in enumerate(right_edge_fragments):
+                if other_index in used_indexes:
+                    continue
+                horizontal_overlap = min(group_x2, other.x2) - max(group_x1, other.x) + 1
+                min_width = min(group_x2 - group_x1 + 1, other.width)
+                vertical_gap = max(other.y - group_y2 - 1, group_y1 - other.y2 - 1, 0)
+                if horizontal_overlap >= min_width * 0.45 and vertical_gap <= max_vertical_gap:
+                    group.append(other)
+                    used_indexes.add(other_index)
+                    changed = True
+        if len(group) >= 2:
+            merged_components.append(merge_fragment_group(group))
+
+    if not merged_components:
+        return components
+    return components + merged_components
 
 
 def repair_perforation_box(
@@ -377,14 +502,47 @@ def repair_perforation_box(
         return perforation
 
     expected_height = round(perforation.width * expected_height_width_ratio)
+    detected_ratio = perforation.height / float(perforation.width)
+    requested_deskew = abs(deskew_degrees_from_vertical(perforation.angle_degrees))
+    if perforation.repaired and perforation.height < image_height * 0.22 and detected_ratio >= 2.0:
+        expected_height = max(expected_height, round(image_height * 0.24))
+        if expected_height > perforation.height:
+            repaired_y = max(0, perforation.y - (expected_height - perforation.height))
+            repaired_height = min(expected_height, image_height - repaired_y)
+            return Component(
+                x=perforation.x,
+                y=repaired_y,
+                width=perforation.width,
+                height=repaired_height,
+                area=perforation.area,
+                fill_ratio=perforation.fill_ratio,
+                angle_degrees=perforation.angle_degrees,
+                repaired=True,
+            )
+
+    if detected_ratio >= 3.0 and perforation.height < image_height * 0.22 and requested_deskew > 2.0:
+        expected_height = max(expected_height, round(image_height * 0.24))
+        if expected_height > perforation.height:
+            repaired_y = max(0, perforation.y - (expected_height - perforation.height))
+            repaired_height = min(expected_height, image_height - repaired_y)
+            return Component(
+                x=perforation.x,
+                y=repaired_y,
+                width=perforation.width,
+                height=repaired_height,
+                area=perforation.area,
+                fill_ratio=perforation.fill_ratio,
+                angle_degrees=perforation.angle_degrees,
+                repaired=True,
+            )
+
     if expected_height <= perforation.height:
         return perforation
 
-    detected_ratio = perforation.height / float(perforation.width)
     if detected_ratio < 1.2:
         return perforation
 
-    if detected_ratio >= expected_height_width_ratio * 0.85:
+    if detected_ratio >= 1.75:
         return perforation
 
     repaired_height = min(expected_height, image_height - perforation.y)
@@ -393,6 +551,45 @@ def repair_perforation_box(
         y=perforation.y,
         width=perforation.width,
         height=repaired_height,
+        area=perforation.area,
+        fill_ratio=perforation.fill_ratio,
+        angle_degrees=perforation.angle_degrees,
+        repaired=True,
+    )
+
+
+def repair_visible_perforation_left_edge(image: np.ndarray, perforation: Component) -> Component:
+    if perforation.repaired:
+        return perforation
+
+    image_height, image_width = image.shape[:2]
+    scan_margin = round(perforation.width * 0.8)
+    x1 = max(0, perforation.x - scan_margin)
+    x2 = min(image_width, perforation.x2 + 1)
+    y1 = max(0, perforation.y)
+    y2 = min(image_height, perforation.y2 + 1)
+    if x2 <= x1 or y2 <= y1:
+        return perforation
+
+    roi = image[y1:y2, x1:x2]
+    bright_mask = roi.max(axis=2) >= 140
+    column_fraction = bright_mask.mean(axis=0)
+    bright_columns = np.where(column_fraction >= 0.05)[0]
+    if len(bright_columns) == 0:
+        return perforation
+
+    visible_left = x1 + int(bright_columns[0])
+    shift = perforation.x - visible_left
+    if shift <= max(24, round(perforation.width * 0.30)):
+        return perforation
+    if shift > round(perforation.width * 0.55):
+        return perforation
+
+    return Component(
+        x=visible_left,
+        y=perforation.y,
+        width=perforation.x2 - visible_left + 1,
+        height=perforation.height,
         area=perforation.area,
         fill_ratio=perforation.fill_ratio,
         angle_degrees=perforation.angle_degrees,
@@ -415,6 +612,40 @@ def validate_jpeg_quality(value: int) -> int:
     if not 1 <= value <= 100:
         raise ValueError("--jpeg-quality must be between 1 and 100")
     return value
+
+
+def parse_search_bound(text: str, label: str) -> int | float:
+    if text.endswith("%"):
+        percent = float(text[:-1])
+        if not 0 <= percent <= 100:
+            raise ValueError(f"{label} percentage must be between 0% and 100%")
+        return percent / 100.0
+    value = int(text)
+    if value < 0:
+        raise ValueError(f"{label} must be non-negative")
+    return value
+
+
+def parse_search_range(value: str | None, label: str) -> tuple[int | float | None, int | float | None]:
+    if value is None or value == "":
+        return None, None
+    if ":" not in value:
+        raise ValueError(f"{label} must use START:END, for example 3600:4056")
+
+    start_text, end_text = value.split(":", maxsplit=1)
+    start = parse_search_bound(start_text, f"{label} start") if start_text else None
+    end = parse_search_bound(end_text, f"{label} end") if end_text else None
+    if start is not None and end is not None and end <= start:
+        raise ValueError(f"{label} end must be greater than start")
+    return start, end
+
+
+def parse_search_area(x_range: str | None, y_range: str | None) -> SearchArea | None:
+    x1, x2 = parse_search_range(x_range, "--perforation-search-x")
+    y1, y2 = parse_search_range(y_range, "--perforation-search-y")
+    if x1 is None and x2 is None and y1 is None and y2 is None:
+        return None
+    return SearchArea(x1=x1 or 0, x2=x2, y1=y1 or 0, y2=y2)
 
 
 def imwrite_jpeg(path: Path, image: np.ndarray, jpeg_quality: int) -> None:
@@ -445,10 +676,16 @@ def crop_box_from_perforation(
 ) -> CropBox:
     crop_height = round(perforation.height * frame_height_perf_ratio * crop_scale)
     crop_width = round(crop_height * frame_aspect)
-    crop_right = round(perforation.x - perforation.width * right_gap_perf_ratio)
+    crop_right = perforation.x
     crop_x = crop_right - crop_width
+    if crop_x < 0:
+        crop_width = max(1, crop_right)
+        crop_x = 0
     crop_center_y = perforation.center_y + perforation.height * center_y_offset_perf_ratio
     crop_y = round(crop_center_y - crop_height / 2)
+    bottom_overflow = crop_y + crop_height - image_height
+    if 0 < bottom_overflow <= 64:
+        crop_y -= bottom_overflow
     return clamp_crop_box(crop_x, crop_y, crop_width, crop_height, image_width, image_height)
 
 
@@ -692,14 +929,14 @@ def annotate_crop_and_perforation(
             (crop_box.x, image.shape[0] - wrapped_height),
             (crop_box.x2, image.shape[0] - 1),
             (0, 255, 0),
-            8,
+            12,
         )
         cv2.rectangle(
             annotated,
             (crop_box.x, 0),
             (crop_box.x2, crop_box.y2),
             (0, 255, 0),
-            8,
+            12,
         )
     elif crop_box.y2 >= image.shape[0]:
         visible_bottom = image.shape[0] - crop_box.y
@@ -709,14 +946,14 @@ def annotate_crop_and_perforation(
             (crop_box.x, crop_box.y),
             (crop_box.x2, image.shape[0] - 1),
             (0, 255, 0),
-            8,
+            12,
         )
         cv2.rectangle(
             annotated,
             (crop_box.x, 0),
             (crop_box.x2, wrapped_height - 1),
             (0, 255, 0),
-            8,
+            12,
         )
     else:
         cv2.rectangle(
@@ -724,14 +961,14 @@ def annotate_crop_and_perforation(
             (crop_box.x, crop_box.y),
             (crop_box.x2, crop_box.y2),
             (0, 255, 0),
-            8,
+            12,
         )
     cv2.rectangle(
         annotated,
         (perforation.x, perforation.y),
         (perforation.x2, perforation.y2),
         (0, 0, 255),
-        8,
+        12,
     )
     cv2.putText(
         annotated,
@@ -740,7 +977,7 @@ def annotate_crop_and_perforation(
         cv2.FONT_HERSHEY_SIMPLEX,
         1.2,
         (0, 255, 0),
-        3,
+        5,
         cv2.LINE_AA,
     )
     cv2.putText(
@@ -750,7 +987,7 @@ def annotate_crop_and_perforation(
         cv2.FONT_HERSHEY_SIMPLEX,
         0.9,
         (0, 0, 255),
-        2,
+        4,
         cv2.LINE_AA,
     )
     cv2.putText(
@@ -760,16 +997,104 @@ def annotate_crop_and_perforation(
         cv2.FONT_HERSHEY_SIMPLEX,
         1.0,
         (0, 255, 255),
-        2,
+        4,
         cv2.LINE_AA,
     )
     imwrite_jpeg(output_path, annotated, jpeg_quality)
 
 
-def detect_perforation(image: np.ndarray, threshold: int, max_chroma: int, min_area: int) -> tuple[Component | None, int]:
-    mask = white_mask(image, threshold, max_chroma)
-    components = find_white_components(mask, min_area)
-    return choose_perforation(components, image.shape[1], image.shape[0]), len(components)
+def relaxed_detection_tiers(threshold: int, max_chroma: int) -> list[tuple[int, int]]:
+    tiers = [
+        (threshold, max_chroma),
+        (min(threshold, 240), max(max_chroma, 20)),
+        (min(threshold, 235), max(max_chroma, 30)),
+        (min(threshold, 230), max(max_chroma, 35)),
+        (min(threshold, 220), max(max_chroma, 60)),
+    ]
+    unique_tiers: list[tuple[int, int]] = []
+    for tier in tiers:
+        if tier not in unique_tiers:
+            unique_tiers.append(tier)
+    return unique_tiers
+
+
+def offset_component(component: Component, x_offset: int, y_offset: int) -> Component:
+    return Component(
+        x=component.x + x_offset,
+        y=component.y + y_offset,
+        width=component.width,
+        height=component.height,
+        area=component.area,
+        fill_ratio=component.fill_ratio,
+        angle_degrees=component.angle_degrees,
+        repaired=component.repaired,
+    )
+
+
+def detect_perforation(
+    image: np.ndarray,
+    threshold: int,
+    max_chroma: int,
+    min_area: int,
+    search_area: SearchArea | None = None,
+) -> tuple[Component | None, int]:
+    x_offset = 0
+    y_offset = 0
+    search_image = image
+    if search_area is not None:
+        x1, x2, y1, y2 = search_area.bounds(image.shape[1], image.shape[0])
+        x_offset = x1
+        y_offset = y1
+        search_image = image[y1:y2, x1:x2]
+
+    best_candidates: list[tuple[Component, int]] = []
+    strict_candidate: Component | None = None
+    last_candidate_count = 0
+    for tier_index, (relaxed_threshold, relaxed_chroma) in enumerate(relaxed_detection_tiers(threshold, max_chroma)):
+        mask = white_mask(search_image, relaxed_threshold, relaxed_chroma)
+        components = find_white_components(mask, min_area)
+        last_candidate_count = len(components)
+        candidate_components = add_merged_perforation_fragments(
+            components,
+            search_image.shape[1],
+            search_image.shape[0],
+            image.shape[1],
+            image.shape[0],
+        )
+        perforation = choose_perforation(
+            candidate_components,
+            search_image.shape[1],
+            search_image.shape[0],
+            size_image_width=image.shape[1],
+            size_image_height=image.shape[0],
+        )
+        if perforation is not None:
+            full_component = offset_component(perforation, x_offset, y_offset)
+            if tier_index == 0:
+                strict_candidate = full_component
+            best_candidates.append((full_component, len(components)))
+
+    if not best_candidates:
+        return None, last_candidate_count
+
+    if strict_candidate is not None:
+        max_replacement_width = max(round(strict_candidate.width * 1.8), strict_candidate.width + 80)
+        filtered_candidates = [
+            candidate
+            for candidate in best_candidates
+            if candidate[0] is strict_candidate or candidate[0].width <= max_replacement_width
+        ]
+        if filtered_candidates:
+            best_candidates = filtered_candidates
+
+    return max(
+        best_candidates,
+        key=lambda candidate: (
+            candidate[0].area,
+            candidate[0].fill_ratio,
+            candidate[0].width,
+        ),
+    )
 
 
 def image_paths_from_folder(folder: Path, pattern: str, name_regex: str) -> list[Path]:
@@ -785,6 +1110,11 @@ def output_path_for_image(image_path: Path, output: Path, input_is_folder: bool)
     if input_is_folder or output.suffix == "":
         return output / f"normalized_{image_path.stem}.jpg"
     return output
+
+
+def fallback_output_path_for_image(image_path: Path, output: Path, input_is_folder: bool) -> Path:
+    output_path = output_path_for_image(image_path, output, input_is_folder)
+    return output_path.with_name(f"fb_{output_path.name}")
 
 
 def annotation_path_for_image(image_path: Path, annotate: Path | None, input_is_folder: bool) -> Path | None:
@@ -804,8 +1134,18 @@ def process_image(
     next_image_path: Path | None = None,
 ) -> dict[str, object]:
     image = load_image(image_path)
+    search_area = parse_search_area(
+        getattr(args, "perforation_search_x", None),
+        getattr(args, "perforation_search_y", None),
+    )
 
-    rectangle, candidate_count = detect_perforation(image, args.threshold, args.max_chroma, args.min_area)
+    rectangle, candidate_count = detect_perforation(
+        image,
+        args.threshold,
+        args.max_chroma,
+        args.min_area,
+        search_area=search_area,
+    )
 
     if rectangle is None:
         raise ValueError(f"No perforation found in {image_path}")
@@ -817,6 +1157,7 @@ def process_image(
         expected_height_width_ratio=args.perforation_height_width_ratio,
         enabled=repair_enabled,
     )
+    rectangle = repair_visible_perforation_left_edge(image, rectangle)
 
     deskew_degrees = 0.0
     if not args.no_deskew:
@@ -826,7 +1167,10 @@ def process_image(
             if abs(deskew_degrees) > 0.01:
                 image = rotate_bound(image, deskew_degrees)
                 rectangle, candidate_count = detect_perforation(
-                    image, args.threshold, args.max_chroma, args.min_area
+                    image,
+                    args.threshold,
+                    args.max_chroma,
+                    args.min_area,
                 )
                 if rectangle is None:
                     raise ValueError(f"No perforation found after deskewing {image_path}")
@@ -836,6 +1180,7 @@ def process_image(
                     expected_height_width_ratio=args.perforation_height_width_ratio,
                     enabled=repair_enabled,
                 )
+                rectangle = repair_visible_perforation_left_edge(image, rectangle)
         else:
             logging.warning(
                 "%s: skipping deskew, detected %.2f degrees, which is above --max-deskew-degrees %.2f",
@@ -894,6 +1239,8 @@ def process_image(
         "cyan_artifact_fraction": round(artifact_fraction, 4),
         "candidate_count": candidate_count,
     }
+    if search_area is not None:
+        result["perforation_search_area"] = search_area.to_log_dict(image.shape[1], image.shape[0])
 
     if annotation_path:
         annotate_crop_and_perforation(image, annotation_path, rectangle, crop_box, deskew_degrees, args.jpeg_quality)
@@ -909,6 +1256,7 @@ def main() -> int:
     try:
         output_size = parse_output_size(args.output_size)
         args.jpeg_quality = validate_jpeg_quality(args.jpeg_quality)
+        parse_search_area(args.perforation_search_x, args.perforation_search_y)
     except ValueError as error:
         logging.error("%s", error)
         return 1
@@ -950,14 +1298,15 @@ def main() -> int:
                 next_image_path=next_image_path,
             )
         except ValueError as error:
-            result = fallback_normalize(image_path, output_path, output_size, args, str(error))
+            fallback_output_path = fallback_output_path_for_image(image_path, output, input_is_folder)
+            result = fallback_normalize(image_path, fallback_output_path, output_size, args, str(error))
             failures += 1
             logging.warning(
                 "[%d/%d] %s -> %s, fallback full-image resize: %s",
                 index,
                 len(image_paths),
                 image_path,
-                output_path,
+                fallback_output_path,
                 error,
             )
         else:
